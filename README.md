@@ -60,51 +60,73 @@ AIMO is 90 problems from AIME 2022–2024. See the paper for baseline numbers, t
 
 | File | Purpose |
 |---|---|
-| `sample.py` | Generates reasoning chains with vLLM under three prompting modes (see below) and writes them to JSONL. |
-| `view_jsonl_results.ipynb` | Loads the JSONL results, truncates each sample to a token budget (2048 / 16384), majority-votes the `\boxed{}` answers and prints accuracy per model. |
+| `sample.py` | Generates reasoning chains with vLLM in three passes (below) and writes one JSONL file per pass. |
+| `edit_search.py` | Runs the dual-goal search (Algorithm 1) offline on the step-constrained samples and reports accuracy and response length. |
+| `mapping.py` | Dataset and model registries (Hugging Face paths, question/answer columns). |
+| `utils.py` | `\boxed{}` answer extraction, answer normalisation, output paths. |
+| `sample_strategy.py` | Answer-selection strategies (`prob_bon`, `sc`). |
+| `view_jsonl_results.ipynb` | Per-step-limit majority-vote analysis of the restrict pass, with outputs truncated to a token budget (2048 / 16384). |
 
-`sample.py` runs three passes in sequence:
+`sample.py` loads the model once and runs three passes. Pass the matching flag to run only some of them; with no flag all three run.
 
-1. **`main_sample`**: standard step-by-step prompt.
-2. **`main_sample_concise`**: the same prompt plus an instruction to keep the reasoning as short as possible.
-3. **`main_restrict`**: the step-constrained prompt above, swept over `num_step` = 16, 15, …, 0 with 16 samples per constraint. Each record stores `max_steps` and, per sample, the text and cumulative log-probability. This is the raw material for the dual-goal search.
+| Pass | Flag | Prompt |
+|---|---|---|
+| `sample` | `--main_sample` | Standard step-by-step prompt. |
+| `concise` | `--main_concise` | Same prompt, plus an instruction to keep the reasoning as short as possible. |
+| `restrict` | `--main_restrict` | Step-constrained prompt above, swept over `num_step` = 16, 15, …, 0 with 16 samples per limit. Each record stores `max_steps` and, per sample, the text and cumulative log-probability. |
 
-> **Note:** `sample.py` and the notebook import helper modules (`utils.py`, `sample_strategy.py`, `mapping.py`) that hold the dataset and model registries, the answer extractor and the output-path logic. These are not yet in this repository.
+Results go to `<output_dir>/<dataset>_<model>_<pass>.jsonl`.
 
 ## Setup
 
 ```bash
-pip install vllm transformers pandas tqdm
+pip install vllm transformers pandas huggingface_hub
 ```
 
-Experiments in the paper ran on 4× NVIDIA A100 80GB with tensor parallelism.
+Datasets are read straight from the Hugging Face Hub. Experiments in the paper ran on 4× NVIDIA A100 80GB with tensor parallelism.
 
 ## Usage
 
-Generate samples (single node; data parallelism across processes is not supported yet, so set `--dp-size 1`):
+**1. Sample.** Use the `restrict` pass for EDIT:
 
 ```bash
-python sample.py \
-    --dataset math500 \
-    --model <model_key> \
-    --strategy all \
-    --dp-size 1 \
-    --tp-size 4 \
-    --max_token 2048
+python sample.py --dataset math500 --model qwen3-8b --main_restrict \
+    --tp-size 4 --max_token 2048
 ```
+
+To use more GPUs, add data parallelism: `--dp-size 2 --tp-size 2` runs two vLLM replicas and merges their outputs. For multi-node runs, add `--node-size`, `--node-rank`, `--master-addr` and `--master-port`; shards are then left per rank for you to concatenate.
 
 | Argument | Default | Description |
 |---|---|---|
-| `--dataset` | `gsm8k` | `gsm8k`, `math500`, `math` or `aimo`. Append `-train` to use a training split. |
-| `--model` | `qwmath7b` | Model key, resolved to a Hugging Face path via `mapping.py`. |
-| `--strategy` | `None` | `all` keeps every sample (used for EDIT). `prob_bon` and `sc` are also defined. |
-| `--n_samples` | `1` | Samples per prompt for the first two passes; the constrained pass always uses 16. |
+| `--dataset` | `gsm8k` | `gsm8k`, `math500` or `aimo`. Append `-train` for the GSM8K training split. |
+| `--model` | `qwmath7b` | Key in `mapping.modelname2hfpath`. Also available: `llama3.1-8b-instruct`, `qwen3-8b`, `qwen3-32b`, `qwq-32b`, `phi4-reasoning`, `r1-distill-qwen1.5b`, `r1-distill-llama8b-instruct`. |
+| `--strategy` | `all` | `all` keeps every sample, which `edit_search.py` needs. `sc` is self-consistency, `prob_bon` is highest log-probability, `none` is greedy decoding. |
+| `--temperature` / `--top_p` | `0.7` / `0.9` | Sampling settings from the paper. |
+| `--restrict_samples` | `16` | Samples per prompt and per step limit in the restrict pass. |
+| `--max_step` | `16` | The restrict pass sweeps `num_step` from this value down to 0. |
+| `--n_samples` | `1` | Samples per prompt in the sample / concise passes. |
 | `--max_token` | `4096` | Max generated tokens. The paper uses 2048 for GSM8K / MATH500 and 16384 for AIMO. |
-| `--tp-size` | `2` | Tensor-parallel size passed to vLLM. |
-| `--gpu_memory_utilization` | `0.95` | vLLM GPU memory fraction. |
-| `--max_examples` | `-1` | Evaluate only the first *k* examples (for debugging). |
+| `--dp-size` / `--tp-size` | `1` / `1` | Data-parallel replicas / tensor-parallel GPUs per replica. |
+| `--output_dir` | `results/edit` | Where result files are written. |
+| `--max_examples` | `-1` | Use only the first *k* examples (for debugging). |
 
-Then open `view_jsonl_results.ipynb`, set `folder` and the glob to where your results were written (the notebook expects `results/<folder>/<dataset>_<model>_*.jsonl`) and run the cells.
+**2. Search.**
+
+```bash
+python edit_search.py results/edit/math500_qwen3-8b_restrict.jsonl --model qwen3-8b \
+    --budget 64 --max_iter 6 --patience 1 --output results/edit/math500_qwen3-8b_edit.jsonl
+```
+
+This prints accuracy and the average token length of the returned responses. With `--output` it also writes, per question, the chosen answer, the response and the full search trace. Omit `--model` to measure length in characters and avoid loading a tokenizer.
+
+Because the search is replayed on pre-sampled outputs, each iteration draws `budget // max_iter` unseen samples at the current step limit. Where Algorithm 1 leaves details open, `edit_search.py` makes these choices:
+
+- τ is the integer step limit, starting at τ_max = 16 and τ_min = 0. Midpoints are rounded down.
+- The consistency check passes when the majority answer matches the previous iteration's and the length statistic drops. Pass `--no_length_drop` to compare answers only.
+- `most_confident(H)` sums each answer's votes over all iterations, breaking ties by the shorter length statistic.
+- The returned response is the shortest sample, among all samples drawn, whose answer matches the final answer.
+
+**3. Analyse (optional).** Open `view_jsonl_results.ipynb`, set `folder` to your output directory under `results/`, and run the cells for the per-step-limit analysis.
 
 ## Citation
 
